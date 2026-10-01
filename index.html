@@ -1,0 +1,317 @@
+<!doctype html><meta charset="utf-8"><title>paper droste</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+<canvas id="c" width="1024" height="1024"></canvas>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}</script>
+<script type="module">
+// paper droste: a paper-craft box robot in a paper diorama bonks a smaller copy of itself that pops out of a name card — infinite zoom loop.
+// Self-similar world: level i is the base diorama scaled by K^i about the fixed point O on the floor; level i's robot runs the same
+// timeline shifted by i*T. Camera, key light, shadow frustum and focus all scale by K^(t/T) about O, so frame(T) == frame(0).
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+const W = 1024, H = 1024, T = 6, K = 0.36;
+const CX = -0.12, CZ = 1.25;                                   // where the child robot stands in its parent's local space
+const O = new THREE.Vector3(CX / (1 - K), 0, CZ / (1 - K));   // fixed point of the similarity p -> O + K (p - O)
+const POP = 3.72, POPLEN = 0.7;                                // child pops at parent tau POP  <=> child tau POP - T
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x)), lerp = (a, b, u) => a + (b - a) * u;
+const ss = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const spring = u => u <= 0 ? 0 : 1 - Math.exp(-4.5 * u) * Math.cos(10 * u);      // elastic 0 -> 1 with overshoot
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+// ---------------- renderer ----------------
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1); renderer.setSize(W, H, false);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.VSMShadowMap;
+const scene = new THREE.Scene(); scene.background = new THREE.Color('#efdcbc');
+const cam = new THREE.PerspectiveCamera(22, W / H, 0.05, 400);
+
+// ---------------- paper textures ----------------
+function paper(w, h, base, { edge = '#fff4ec', ew = 0.022, draw, seed = 1, grain = 9 } = {}) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'), r = rng(seed);
+  g.fillStyle = base; g.fillRect(0, 0, w, h);
+  draw && draw(g, w, h, r);
+  const id = g.getImageData(0, 0, w, h), d = id.data;
+  for (let i = 0; i < d.length; i += 4) { const n = (r() - .5) * grain; d[i] += n; d[i + 1] += n; d[i + 2] += n; }
+  g.putImageData(id, 0, 0);
+  g.lineWidth = 1; g.strokeStyle = 'rgba(255,255,255,.07)';                                  // paper fibres
+  for (let i = 0; i < w * h / 1800; i++) { const x = r() * w, y = r() * h, a = r() * 6.3; g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x + 6 * Math.cos(a + 1), y + 6 * Math.sin(a + 1), x + 12 * Math.cos(a), y + 12 * Math.sin(a)); g.stroke(); }
+  if (edge) { const e = Math.max(2, Math.round(Math.min(w, h) * ew)); g.strokeStyle = edge; g.lineWidth = e; g.strokeRect(e / 2, e / 2, w - e, h - e); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t;
+}
+const lam = (map, extra = {}) => new THREE.MeshLambertMaterial({ map, ...extra });
+const col = c => new THREE.MeshLambertMaterial({ color: c });
+function mesh(geo, mat, parent, x = 0, y = 0, z = 0) { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = m.receiveShadow = true; parent && parent.add(m); return m; }
+
+const CORAL = '#e2735b', INK = '#1f1a19';
+const eyeTex = kind => paper(512, 375, CORAL, { seed: 7, ew: .011, draw: (g, w, h) => {
+  g.fillStyle = g.strokeStyle = INK; const ey = .46 * h;
+  for (const x of [.3, .7]) { const cx = x * w;
+    if (kind === 'open') g.fillRect(cx - 30, ey - 32, 60, 66);
+    else if (kind === 'big') g.fillRect(cx - 39, ey - 43, 78, 88);
+    else if (kind === 'closed') g.fillRect(cx - 34, ey - 5, 68, 10);
+    else { g.lineWidth = 15; g.lineJoin = 'miter'; g.beginPath(); g.moveTo(cx - 36, ey + 20); g.lineTo(cx, ey - 20); g.lineTo(cx + 36, ey + 20); g.stroke(); } } } });
+const EYES = { open: eyeTex('open'), big: eyeTex('big'), closed: eyeTex('closed'), happy: eyeTex('happy') };
+const coralSide = lam(paper(256, 256, CORAL, { seed: 3, ew: .012 })), coralTop = lam(paper(256, 256, '#e67c64', { seed: 4, ew: .012 }));
+const legMat = lam(paper(128, 128, CORAL, { seed: 5, ew: .05, draw: (g, w, h) => {   // legs sit in the body's shade: dark at the top, lit at the feet
+  const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(45,18,12,.55)'); gr.addColorStop(.45, 'rgba(45,18,12,.15)'); gr.addColorStop(1, 'rgba(45,18,12,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, w, h); } }));
+const rbox = (w, h, d, r, seg = 4) => new RoundedBoxGeometry(w, h, d, seg, r);
+const wallTex = paper(1024, 284, '#e5efd4', { seed: 11, ew: .012, draw: (g, w, h) => {
+  g.fillStyle = '#d5e6c6'; for (let x = 10; x < w; x += 34) g.fillRect(x, 0, 13, h);
+  const wy = h * .71; g.fillStyle = '#5b9d8b'; g.fillRect(0, wy, w, h - wy);
+  g.fillStyle = '#a8d2bf'; g.fillRect(0, wy, w, 7); g.fillStyle = '#4b8b7a'; g.fillRect(0, wy + 7, w, 3);
+  g.strokeStyle = '#4f917f'; g.lineWidth = 3; for (let x = 18; x + 90 < w; x += 112) g.strokeRect(x, wy + 20, 90, h - wy - 36); } });
+const paintTex = paper(256, 200, '#cfe3dc', { edge: '#6e4128', ew: .09, seed: 5, draw: (g, w, h) => {
+  const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, '#bcdde0'); gr.addColorStop(.6, '#f4e2b4'); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  g.fillStyle = '#f0a33e'; g.beginPath(); g.arc(w * .68, h * .5, 26, 0, 7); g.fill();
+  g.fillStyle = '#76b05c'; g.beginPath(); g.ellipse(w * .25, h * 1.05, w * .6, h * .45, 0, 0, 7); g.fill();
+  g.fillStyle = '#4f8e46'; g.beginPath(); g.ellipse(w * .85, h * 1.1, w * .55, h * .42, 0, 0, 7); g.fill(); } });
+const winTex = paper(320, 210, '#a9d3ec', { edge: '#fbfaf5', ew: .08, seed: 6, draw: (g, w, h) => {
+  g.fillStyle = '#f8fbfd'; for (const [x, y, r] of [[.3, .45, 24], [.42, .38, 30], [.55, .47, 22], [.8, .3, 16], [.88, .34, 13]]) { g.beginPath(); g.arc(x * w, y * h, r, 0, 7); g.fill(); }
+  g.fillStyle = '#fbfaf5'; g.fillRect(w / 2 - 6, 0, 12, h); g.fillRect(0, h / 2 - 5, w, 10); } });
+const rugTex = paper(512, 512, '#e9cfa6', { edge: null, seed: 8, draw: (g, w) => {
+  const c = w / 2, ring = (r, f) => { g.fillStyle = f; g.beginPath(); g.arc(c, c, r * c, 0, 7); g.fill(); };
+  ring(1, '#dfe2df'); ring(.955, '#86a4cc'); ring(.8, '#f5f3ec'); ring(.74, '#7e9dca'); } });
+const cardTex = paper(512, 72, '#2d3d68', { edge: '#e8ecf3', ew: .06, seed: 9, draw: (g, w, h, r) => {
+  g.fillStyle = '#e9e6dc'; for (let i = 0; i < 70; i++) { g.beginPath(); g.arc(r() * w, r() * h, 1.2 + r() * 2.6, 0, 7); g.fill(); }
+  g.fillStyle = '#e2735b'; const px = 9, ox = w / 2 - 6 * px, oy = h / 2 - 3 * px;               // pixel robot
+  ['.1111111111.', '111..11..111', '111111111111', '1..1....1..1'].forEach((row, j) => [...row].forEach((ch, i) => ch === '1' && g.fillRect(ox + i * px, oy + j * px * 1.5, px, px * 1.5))); } });
+const floorMat = new THREE.MeshLambertMaterial({ color: '#f6e3c3', polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 4 });
+const blobMat = (() => {   // contact AO under the feet: soft radial darkening
+  const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d'), gr = g.createRadialGradient(64, 64, 8, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(70,40,20,.62)'); gr.addColorStop(.5, 'rgba(70,40,20,.28)'); gr.addColorStop(1, 'rgba(70,40,20,0)'); g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c); return new THREE.MeshBasicMaterial({ map: t, transparent: true, depthWrite: false });
+})();
+
+// ---------------- shared geometry ----------------
+const BODY = { w: 1.12, h: .82, d: .9, leg: .3 };
+const TOP = BODY.leg + BODY.h;
+const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+const leafShape = new THREE.Shape(); leafShape.moveTo(0, 0); leafShape.quadraticCurveTo(.1, .22, 0, .5); leafShape.quadraticCurveTo(-.1, .22, 0, 0);
+const leafGeo = new THREE.ShapeGeometry(leafShape, 6);
+const leafMats = [lam(paper(64, 128, '#5ea953', { edge: null, seed: 12 }), { side: THREE.DoubleSide }), lam(paper(64, 128, '#48924a', { edge: null, seed: 13 }), { side: THREE.DoubleSide })];
+const CONF = ['#4e9a8a', '#e2735b', '#f1c24b', '#f6ebd9', '#8faad0', '#e8a9a0', '#63a96b'];
+
+function makePencil() {
+  const p = new THREE.Group(), yel = lam(paper(128, 128, '#f2b33d', { edge: null, seed: 21 }));
+  mesh(new THREE.CylinderGeometry(.042, .042, .1, 16), col('#f09a9a'), p, 0, .05, 0);                 // eraser
+  mesh(new THREE.CylinderGeometry(.045, .045, .14, 16), new THREE.MeshStandardMaterial({ color: '#b8b8b0', metalness: .7, roughness: .35 }), p, 0, .17, 0);
+  mesh(new THREE.CylinderGeometry(.045, .045, 1.03, 6), yel, p, 0, .755, 0);
+  mesh(new THREE.CylinderGeometry(.008, .045, .15, 6), col('#e9c49b'), p, 0, 1.345, 0);
+  mesh(new THREE.ConeGeometry(.011, .035, 8), col('#3a3434'), p, 0, 1.43, 0);
+  return p;
+}
+const PENCIL_LEN = 1.45, ARM_LEN = .22;
+
+function makeLevel(i) {
+  const g = new THREE.Group(), s = Math.pow(K, i); g.scale.setScalar(s); g.position.copy(O).multiplyScalar(1 - s); scene.add(g);
+  // wall board + cut-outs
+  const wall = new THREE.Group(); wall.position.set(.2, 0, -1.0); g.add(wall);
+  mesh(box(4.5, 1.25, .05), [lam(wallTex), lam(wallTex), col('#f5f1e6'), col('#f5f1e6'), lam(wallTex), col('#e8e2d2')], wall, 0, .625, 0);
+  mesh(box(.58, .46, .03), [col('#6e4128'), col('#6e4128'), col('#6e4128'), col('#6e4128'), lam(paintTex), col('#6e4128')], wall, -1.45, .7, .04);
+  mesh(box(.8, .52, .03), [col('#fbfaf5'), col('#fbfaf5'), col('#fbfaf5'), col('#fbfaf5'), lam(winTex), col('#fbfaf5')], wall, .58, .74, .04);
+  const shelf = new THREE.Group(); shelf.position.set(1.55, .66, .03); wall.add(shelf);
+  mesh(box(.62, .035, .15), col('#7a4a2e'), shelf, 0, 0, .075);
+  mesh(box(.035, .12, .1), col('#6a3f27'), shelf, -.2, -.07, .05);
+  [['#e0594a', .07, .25], ['#3e6fb5', .065, .29], ['#f1c24b', .075, .26], ['#63a96b', .065, .28], ['#ede6d6', .06, .22]].reduce((x, [c, w, h]) => { mesh(box(w, h, .12), col(c), shelf, x + w / 2, .018 + h / 2, .075); return x + w + .008; }, -.19);
+  // lamp
+  const lamp = new THREE.Group(); lamp.position.set(-1.55, 0, -.55); g.add(lamp);
+  mesh(new THREE.CylinderGeometry(.17, .19, .035, 28), col('#e2a445'), lamp, 0, .018, 0);
+  mesh(new THREE.CylinderGeometry(.018, .018, 1.0, 10), col('#e2a445'), lamp, 0, .52, 0);
+  mesh(new THREE.CylinderGeometry(.2, .3, .32, 32), new THREE.MeshLambertMaterial({ color: '#f8e5c8', emissive: '#6b4a20', emissiveIntensity: .25, side: THREE.DoubleSide }), lamp, 0, 1.1, 0);
+  // plant
+  const plant = new THREE.Group(); plant.position.set(2.05, 0, .05); g.add(plant);
+  mesh(new THREE.CylinderGeometry(.2, .17, .3, 28), col('#f4f1ea'), plant, 0, .15, 0);
+  mesh(new THREE.CylinderGeometry(.202, .19, .045, 28), col('#9fcfb4'), plant, 0, .21, 0);
+  const pr = rng(40); for (let j = 0; j < 9; j++) { const a = j / 9 * 6.28 + pr(), l = mesh(leafGeo, leafMats[j % 2], plant, 0, .26, 0);
+    l.rotation.set(0, a, 0); l.rotateX(-.25 - pr() * .35); l.scale.setScalar(.9 + pr() * .6); }
+  // rug + card
+  const rug = mesh(new THREE.CircleGeometry(.98, 64), lam(rugTex), g, 0, .004, 0); rug.rotation.x = -Math.PI / 2; rug.castShadow = false;
+  const card = new THREE.Group(); card.position.set(CX, 0, 1.2); g.add(card);
+  mesh(box(1.85, .018, .26), [col('#e8ecf3'), col('#e8ecf3'), lam(cardTex), col('#2d3d68'), col('#e8ecf3'), col('#e8ecf3')], card, 0, .009, 0);
+  // robot: rig pivots at the feet
+  const rig = new THREE.Group(); g.add(rig);
+  const body = new THREE.Group(); body.position.y = BODY.leg; rig.add(body);
+  const face = lam(EYES.closed);
+  mesh(rbox(BODY.w, BODY.h, BODY.d, .09, 5), [coralSide, coralSide, coralTop, coralSide, face, coralSide], body, 0, BODY.h / 2, 0);
+  mesh(box(BODY.w - .2, BODY.leg + .01, BODY.d - .42), col('#2e1a16'), rig, 0, (BODY.leg + .01) / 2, -.04);   // dark underside between the legs
+  [-.39, -.13, .13, .39].forEach(x => mesh(rbox(.23, BODY.leg + .08, .72, .085, 6), legMat, rig, x, (BODY.leg + .08) / 2 - .01, 0));   // chunky rounded pillars
+  const armTex = lam(paper(128, 112, CORAL, { seed: 17, ew: .06 }));       // flat paper flaps hinged on the side faces
+  const arms = [-1, 1].map(sx => { const a = new THREE.Group(); a.position.set(sx * BODY.w / 2, .47, .05); body.add(a);
+    mesh(rbox(ARM_LEN, .2, .07, .025, 3), armTex, a, sx * ARM_LEN / 2, 0, 0); return a; });
+  const stickers = [['#4e9a8a', -.12, .08, .13, .08, .3], ['#f3ead8', .3, -.22, .12, .07, -.4]].map(([c, x, z, w, d, r]) => {
+    const m = mesh(box(w, .006, d), col(c), body, x, BODY.h + .003, z); m.rotation.y = r; return m; });
+  const pencil = makePencil(); g.add(pencil);
+  // confetti: closed-form flight with linear drag, from the card at POP
+  const N = 85, cr = rng(100 + i), conf = new THREE.InstancedMesh(new THREE.PlaneGeometry(.095, .062), new THREE.MeshLambertMaterial({ side: THREE.DoubleSide }), N);
+  conf.castShadow = true; g.add(conf);
+  const pieces = [];
+  for (let j = 0; j < N; j++) {
+    const p = { p0: new THREE.Vector3(CX + (cr() - .5) * 1.6, .1, 1.2 + (cr() - .5) * .2), v: new THREE.Vector3((cr() - .5) * 13, 2.5 + cr() * 4.5, (cr() - .3) * 7),
+      spin: new THREE.Vector3((cr() - .5) * 24, (cr() - .5) * 24, (cr() - .5) * 24), yaw: cr() * 6.3, s: .7 + cr() * .7, delay: cr() * .08 };
+    conf.setColorAt(j, new THREE.Color(CONF[j % CONF.length]));
+    let lo = 0, hi = 6; for (let k = 0; k < 40; k++) { const m = (lo + hi) / 2; (flight(p, m).y > .004 ? lo = m : hi = m); } p.land = hi;   // time to hit the floor
+    pieces.push(p);
+  }
+  const blob = new THREE.Mesh(new THREE.PlaneGeometry(1.7, 1.5), blobMat); blob.rotation.x = -Math.PI / 2; blob.renderOrder = 1; g.add(blob);
+  for (const [x, z, r] of [[-1.55, -.55, .5], [2.05, .05, .55]]) { const m = new THREE.Mesh(new THREE.PlaneGeometry(r, r), blobMat); m.rotation.x = -Math.PI / 2; m.position.set(x, .005, z); g.add(m); }
+  return { blob, i, g, wall, lamp, plant, rug, card, rig, body, face, arms, stickers, pencil, conf, pieces };
+}
+const DRAG = 3.4, GRAV = 7;   // paper: strong drag, slow terminal flutter
+function flight(p, a) {   // position a seconds after release: v/k (1-e^-ka), gravity with terminal velocity
+  const e = (1 - Math.exp(-DRAG * a)) / DRAG, vt = GRAV / DRAG;
+  return new THREE.Vector3(p.p0.x + p.v.x * e + Math.sin(a * 5 + p.yaw) * .08 * a, p.p0.y + (p.v.y + vt) * e - vt * a, p.p0.z + p.v.z * e);
+}
+
+const LEVELS = [-2, -1, 0, 1].map(makeLevel);
+scene.add(mesh(new THREE.PlaneGeometry(3000, 3000), floorMat)); scene.children.at(-1).rotation.x = -Math.PI / 2; scene.children.at(-1).castShadow = false;
+
+// ---------------- light ----------------
+const hemi = new THREE.HemisphereLight('#fff6ea', '#d8b88e', 2.3); scene.add(hemi);
+const key = new THREE.DirectionalLight('#ffe9cc', 1.8); key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -.0006; key.shadow.radius = 14; key.shadow.blurSamples = 20; scene.add(key, key.target);
+const KEY_POS = new THREE.Vector3(-3.5, 7, 5.5), KEY_TGT = new THREE.Vector3(0, 0, 0), SHADOW_R = 8;
+const CAM_POS = new THREE.Vector3(0.24, 5.05, 11.4), CAM_TGT = new THREE.Vector3(0.04, .88, .25);
+
+// ---------------- post: depth bokeh + soft paper grade ----------------
+const rt = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, samples: 4 });
+rt.depthTexture = new THREE.DepthTexture(W, H); rt.depthTexture.type = THREE.FloatType;
+const post = new THREE.ShaderMaterial({
+  uniforms: { tC: { value: rt.texture }, tD: { value: rt.depthTexture }, near: { value: 1 }, far: { value: 1 }, focus: { value: 8 }, ap: { value: 95 }, px: { value: new THREE.Vector2(1 / W, 1 / H) }, seed: { value: 0 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
+  fragmentShader: `
+    uniform sampler2D tC, tD; uniform float near, far, focus, ap, seed; uniform vec2 px; varying vec2 vUv;
+    float lin(vec2 uv){ float z = texture2D(tD, uv).x * 2. - 1.; return 2. * near * far / (far + near - z * (far - near)); }
+    float coc(vec2 uv){ float k = 1. - focus / lin(uv); return min(ap * (k > 0. ? k : -.3 * k), 40.); }   // far blurs hard, near stays crisp
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233)) + seed) * 43758.5453); }
+    void main(){
+      float c0 = coc(vUv); vec3 acc = texture2D(tC, vUv).rgb; float wsum = 1.;
+      if (c0 > .6) for (int i = 1; i < 80; i++) {
+        float r = sqrt(float(i) / 80.) * c0, a = float(i) * 2.39996; vec2 uv = vUv + vec2(cos(a), sin(a)) * r * px;
+        float w = smoothstep(r - 1.5, r, coc(uv) + .5); acc += texture2D(tC, uv).rgb * w; wsum += w; }
+      vec3 col = acc / wsum;
+      col = col / (1. + .12 * col);                                   // soft shoulder
+      col = pow(col, vec3(1. / 2.2));
+      col = mix(col, col * vec3(1.03, 1., .95), .6);                    // warm paper grade
+      col = mix(vec3(dot(col, vec3(.299,.587,.114))), col, 1.14);
+      vec2 q = vUv - .5; col *= 1. - .28 * dot(q, q);
+      col += (hash(vUv * 1024.) - .5) * .018;
+      gl_FragColor = vec4(col, 1.);
+    }`, depthWrite: false, depthTest: false });
+const postScene = new THREE.Scene(), postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), post));
+
+// ---------------- choreography (tau = the robot's own clock; child pops at tau POP, own pop at POP - T) ----------------
+// tau = seconds on the middle robot's clock; tau > 6 is what the parent does on screen
+const trk = (keys, x) => {   // smoothstep between [t, v] keys, clamped
+  if (x <= keys[0][0]) return keys[0][1];
+  for (let i = 1; i < keys.length; i++) if (x <= keys[i][0]) return lerp(keys[i - 1][1], keys[i][1], ss(keys[i - 1][0], keys[i][0], x));
+  return keys.at(-1)[1];
+};
+const V = (x, y, z) => new THREE.Vector3(x, y, z), KID = V(CX - .1 * K, TOP * K + .004, CZ);
+const POSE = {   // pencil: eraser end E, grip G (pencil runs from E through G)
+  idle: [V(-.83, 0, .08), V(-.83, 1.3, .08)], wave: [V(-.8, .4, .14), V(-1.3, 1.36, .12)],   // wave: held low, the top swings out
+  card: [V(CX - .2, .03, 1.2), V(-.76, .82, .3)], kidUp: [KID.clone().add(V(-.1, .3, -.1)), V(-.78, .86, .26)], kid: [KID, V(-.78, .86, .26)],
+  hover: [KID.clone().add(V(-.34, .08, -.02)), V(-.78, .86, .26)], poke: [KID.clone().add(V(-.24, .02, 0)), V(-.78, .86, .26)],
+  away: [V(-.86, .55, .1), V(-.86, 1.85, .1)] };   // after the bonk: pencil yanked straight up
+// [time, pose, ease]: 'i' ease-in (hits land hard), 'o' ease-out, else smooth
+const PENCIL = [[-9, 'idle'], [2.0, 'idle'], [2.14, 'wave', 'o'], [2.28, 'idle'], [2.43, 'wave', 'o'], [2.6, 'idle'], [3.3, 'idle'], [3.6, 'card', 'i'], [3.72, 'card'],
+  [3.9, 'hover', 'o'], [3.98, 'poke', 'i'], [4.1, 'hover'], [4.75, 'hover'], [4.86, 'poke', 'i'], [4.98, 'hover'], [5.3, 'hover'], [5.62, 'kid', 'i'], [6.03, 'kid'],
+  [6.28, 'away', 'o'], [7.6, 'away'], [8.0, 'idle'], [8.1, 'wave', 'o'], [8.25, 'idle'], [8.4, 'wave', 'o'], [8.56, 'idle'], [99, 'idle']];
+const EASE = { i: u => u * u * u, o: u => 1 - (1 - u) ** 3 };
+function pencilAt(tau) {
+  let i = 1; while (PENCIL[i][0] < tau) i++;
+  const [t0, p0] = PENCIL[i - 1], [t1, p1, e] = PENCIL[i], u = (EASE[e] || (x => x * x * (3 - 2 * x)))(clamp((tau - t0) / (t1 - t0)));
+  const E = POSE[p0][0].clone().lerp(POSE[p1][0], u), G = POSE[p0][1].clone().lerp(POSE[p1][1], u);
+  E.y += Math.sin(Math.PI * u) * .12 * POSE[p0][0].distanceTo(POSE[p1][0]);
+  return { E, G };
+}
+const HAPPY = [[2.0, 2.75], [3.98, 4.42], [4.84, 5.08], [6.08, 6.36], [7.8, 9.05], [9.85, 11.3], [12.08, 12.36], [13.8, 15]];
+const BIG = [[1.35, 1.95], [9.25, 9.85]];                                           // wide-eyed while the parent leans in / watches the pop
+const BLINKS = [1.1, 3.05, 5.4, 11.8];
+const YAW = [[.45, 0], [.62, -.25], [.8, -.24], [1.0, .22], [1.15, .22], [1.35, 0], [3.3, 0], [3.58, -.42], [3.76, -.42], [4.0, -.15], [5.3, -.15], [5.6, -.12], [6.05, -.12], [6.3, .6], [7.1, .6], [7.3, 0]];   // parent turns aside after the bonk
+const PITCH = [[3.3, 0], [3.58, .2], [3.76, .18], [4.0, .05], [5.4, .05], [5.7, .1], [6.05, .1], [6.35, 0], [7.15, 0], [7.38, .17], [7.8, .15], [8.0, 0], [9.1, 0], [9.3, .17], [9.75, .15], [9.95, 0]];
+const LEAN = [[7.15, 0], [7.38, .24], [7.8, .21], [8.0, 0], [9.1, 0], [9.3, .24], [9.75, .22], [9.95, 0]];   // parent shuffles toward the kid (face gets big)
+const ROLL = [[.45, 0], [.62, -.04], [.8, -.04], [1.0, .04], [1.15, .04], [1.35, 0], [3.3, 0], [3.58, .1], [3.76, .1], [4.0, .03], [5.4, .03], [5.7, 0]];
+const HOPS = [[.12, .42, .17], [1.98, 2.2, .07], [7.98, 8.2, .07]];                 // [start, end, height]
+const HITS = [[5.62, 6.03]];                                                       // my eraser on the kid's head
+const inAny = (x, arr) => arr.some(([a, b]) => x >= a && x <= b);
+
+function poseLevel(L, tau) {
+  const p0 = POP - T;                                                     // own pop time
+  L.g.visible = tau > p0;
+  if (!L.g.visible) return;
+  const stag = d => Math.max(1e-3, spring((tau - p0 - d) / .32));         // fast pop-up book with overshoot
+  L.wall.rotation.x = -Math.PI / 2 * (1 - spring((tau - p0) / .3)); L.wall.scale.setScalar(Math.max(1e-3, ss(0, .05, tau - p0)));
+  L.rug.scale.setScalar(stag(0)); L.lamp.scale.setScalar(stag(.05)); L.plant.scale.setScalar(stag(.08));
+  const cs = stag(.1) * (tau < POP ? 1 + .3 * Math.sin(ss(POP - .12, POP, tau) * Math.PI) : Math.max(0, 1 - (tau - POP) / .08));
+  L.card.visible = cs > .002; L.card.scale.setScalar(Math.max(1e-3, cs));
+  // robot body
+  const rs = stag(.03);
+  let hop = 0, sy = 1;
+  for (const [a, b, h] of HOPS) {
+    const u = (tau - a) / (b - a), k = h / .17;
+    if (u > -.35 && u < 0) sy -= .1 * k * Math.sin(-u / .35 * Math.PI);                          // anticipation crouch
+    if (u >= 0 && u <= 1) { hop += h * Math.sin(Math.PI * u); sy += .08 * k * Math.sin(Math.PI * u); }
+    const x = tau - b; if (x > 0 && x < .7) sy -= .1 * k * Math.exp(-8 * x) * Math.cos(16 * x);   // landing squash
+  }
+  for (const [a, b] of HITS) {                                             // parent's eraser on my head (its HITS, one loop later)
+    const x0 = tau + T - a, x1 = tau + T - b;
+    if (x0 > 0 && x1 < 0) sy -= .17 * ss(0, .05, x0);
+    if (x1 >= 0 && x1 < .8) sy -= .17 * Math.exp(-7 * x1) * Math.cos(20 * x1);
+  }
+  const wig = inAny(tau, [[2.0, 2.7], [7.95, 8.7]]) ? Math.sin((tau % 6 - 2) * 26) * .06 : 0;
+  L.rig.scale.set(rs * (2 - sy) ** .5, rs * sy, rs * (2 - sy) ** .5);
+  L.rig.position.set(0, hop * rs, trk(LEAN, tau));
+  L.rig.rotation.set(trk(PITCH, tau), trk(YAW, tau), trk(ROLL, tau) + wig);
+  // pencil + arms
+  const { E, G } = pencilAt(tau);
+  E.y += hop * clamp(E.y * 3 + .5); G.y += hop; E.z += L.rig.position.z; G.z += L.rig.position.z;
+  const dir = G.sub(E).normalize();
+  L.pencil.position.copy(E); L.pencil.quaternion.setFromUnitVectors(V(0, 1, 0), dir); L.pencil.scale.setScalar(rs);
+  // the pencil paw: flap aims its tip at the nearest point of the pencil, so the pencil is always in the paw
+  L.rig.updateMatrixWorld(true);
+  const S = L.g.worldToLocal(L.arms[0].getWorldPosition(V(0, 0, 0)));
+  const P = E.clone().addScaledVector(dir, clamp(S.clone().sub(E).dot(dir), 0, PENCIL_LEN)), d = P.sub(S), len = d.length();
+  const qi = L.rig.quaternion.clone().invert();
+  L.arms[0].quaternion.setFromUnitVectors(V(-1, 0, 0), d.applyQuaternion(qi).normalize());
+  L.arms[0].scale.set(clamp((len + .02) / ARM_LEN, .5, 1.8), 1, 1);
+  const flap = inAny(tau, HAPPY) ? .45 + Math.sin(tau * 24) * .3 : Math.sin(tau * 2.3) * .06;
+  L.arms[1].rotation.set(0, -.25, flap);
+  const blink = BLINKS.some(b => tau > b && tau < b + .12);
+  L.face.map = tau < .08 || blink ? EYES.closed : inAny(tau, HAPPY) ? EYES.happy : inAny(tau, BIG) ? EYES.big : EYES.open;
+  L.stickers.forEach(m => m.visible = tau > POP + .6);
+  L.blob.position.set(0, .006, L.rig.position.z); L.blob.scale.setScalar(rs * (1 - hop * 1.2));
+  // confetti
+  const a0 = tau - POP, dummy = new THREE.Object3D();
+  L.conf.visible = a0 > 0;
+  if (L.conf.visible) L.pieces.forEach((p, j) => {
+    const a = Math.max(0, a0 - p.delay), landed = a >= p.land;
+    dummy.position.copy(flight(p, Math.min(a, p.land)));
+    if (landed) dummy.rotation.set(-Math.PI / 2, 0, p.yaw); else dummy.rotation.set(p.spin.x * a, p.spin.y * a, p.spin.z * a);
+    dummy.scale.setScalar(a > 0 ? p.s * (1 - ss(5.2, 5.9, tau)) + 1e-3 : 1e-3); dummy.updateMatrix(); L.conf.setMatrixAt(j, dummy.matrix);
+  });
+  L.conf.instanceMatrix.needsUpdate = true;
+}
+
+// ---------------- frame ----------------
+const tmp = new THREE.Vector3(), scaled = (v, s) => tmp.copy(v).sub(O).multiplyScalar(s).add(O).clone();
+// zoom: slow drift + the real dolly-in after the kid is up (C1 across the loop seam)
+const ZOOM = t => .03 * t / T + .97 * ss(4.8, 6, t);
+window.frame = async t => {
+  t = ((t % T) + T) % T;
+  const s = Math.pow(K, ZOOM(t));
+  for (const L of LEVELS) poseLevel(L, t - L.i * T);
+  cam.position.copy(scaled(CAM_POS, s)); cam.lookAt(scaled(CAM_TGT, s)); cam.near = .05 * s; cam.far = 400 * s; cam.updateProjectionMatrix();
+  key.position.copy(scaled(KEY_POS, s)); key.target.position.copy(scaled(KEY_TGT, s)); key.target.updateMatrixWorld();
+  Object.assign(key.shadow.camera, { left: -SHADOW_R * s, right: SHADOW_R * s, top: SHADOW_R * s, bottom: -SHADOW_R * s, near: .5 * s, far: 30 * s });
+  key.shadow.camera.updateProjectionMatrix(); key.shadow.normalBias = .01 * s;
+  // focus rides the current robot, hands over to the kid late in the loop
+  const sig = Math.pow(K, ss(5.1, 5.95, t)), fp = scaled(new THREE.Vector3(0, .6, 0), sig);   // focus slides from this robot to the kid (camera scale is already in cam.position)
+  post.uniforms.focus.value = cam.position.distanceTo(fp); post.uniforms.near.value = cam.near; post.uniforms.far.value = cam.far; post.uniforms.seed.value = t * 7.3;
+  renderer.setRenderTarget(rt); renderer.render(scene, cam); renderer.setRenderTarget(null); renderer.render(postScene, postCam);
+};
+await window.frame(0);
+window.ready = true;
+</script>
